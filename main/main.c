@@ -8,6 +8,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "driver/uart.h"
 #include "driver/adc_types_legacy.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
@@ -46,6 +47,9 @@ static const char *TAG = "c6-temp-adc";
 #define NTC_VALID_MIN_MV           80.0f
 #define NTC_VALID_MAX_MV           3220.0f
 #define BLE_TEMP_DEVICE_NAME       "C6-TEMP-SENSOR"
+#define UART_TX_PORT               UART_NUM_1
+#define UART_TX_PIN                16
+#define UART_TX_BAUD               115200
 
 // Shared BLE profile with ESP32-P4 client.
 static const ble_uuid128_t BLE_TEMP_SERVICE_UUID =
@@ -226,14 +230,11 @@ static int ble_temp_gap_event(struct ble_gap_event *event, void *arg)
 static void ble_temp_advertise(void)
 {
     struct ble_hs_adv_fields fields = {0};
+    struct ble_hs_adv_fields rsp_fields = {0};
     struct ble_gap_adv_params adv_params = {0};
 
+    /* Keep primary ADV payload small enough for legacy advertising (31 bytes). */
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    fields.tx_pwr_lvl_is_present = 1;
-    fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
-    fields.name = (uint8_t *)BLE_TEMP_DEVICE_NAME;
-    fields.name_len = strlen(BLE_TEMP_DEVICE_NAME);
-    fields.name_is_complete = 1;
     fields.uuids128 = (ble_uuid128_t *)&BLE_TEMP_SERVICE_UUID;
     fields.num_uuids128 = 1;
     fields.uuids128_is_complete = 1;
@@ -241,6 +242,16 @@ static void ble_temp_advertise(void)
     int rc = ble_gap_adv_set_fields(&fields);
     if (rc != 0) {
         ESP_LOGE(TAG, "BLE adv set fields failed; rc=%d", rc);
+        return;
+    }
+
+    /* Put device name in scan response to avoid overflowing advertising payload. */
+    rsp_fields.name = (uint8_t *)BLE_TEMP_DEVICE_NAME;
+    rsp_fields.name_len = strlen(BLE_TEMP_DEVICE_NAME);
+    rsp_fields.name_is_complete = 1;
+    rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "BLE adv rsp set fields failed; rc=%d", rc);
         return;
     }
 
@@ -339,6 +350,43 @@ static void ble_temp_publish(float temp_c)
     }
 }
 
+static void uart_temp_tx_init(void)
+{
+    const uart_config_t cfg = {
+        .baud_rate = UART_TX_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+
+    ESP_ERROR_CHECK(uart_driver_install(UART_TX_PORT, 0, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(UART_TX_PORT, &cfg));
+    ESP_ERROR_CHECK(uart_set_pin(UART_TX_PORT,
+                                 UART_TX_PIN,
+                                 UART_PIN_NO_CHANGE,
+                                 UART_PIN_NO_CHANGE,
+                                 UART_PIN_NO_CHANGE));
+
+    ESP_LOGI(TAG, "UART temperature TX ready on UART%d TX=%d baud=%d",
+             (int)UART_TX_PORT, UART_TX_PIN, UART_TX_BAUD);
+}
+
+static void uart_temp_tx_publish(float temp_c)
+{
+    char line[48];
+    int n = snprintf(line, sizeof(line), "TEMP,%.2f\r\n", (double)temp_c);
+    if (n <= 0) {
+        return;
+    }
+
+    int written = uart_write_bytes(UART_TX_PORT, line, n);
+    if (written != n) {
+        ESP_LOGW(TAG, "UART temp write short: %d/%d", written, n);
+    }
+}
+
 void app_main(void)
 {
     esp_err_t ret = nvs_flash_init();
@@ -349,6 +397,7 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     ESP_ERROR_CHECK(ble_temp_init());
+    uart_temp_tx_init();
 
     adc_oneshot_unit_handle_t adc_handle;
     adc_oneshot_unit_init_cfg_t init_config = {
@@ -433,6 +482,7 @@ void app_main(void)
                      ntc_res_ohm,
                      temp_c);
             ble_temp_publish(temp_c);
+            uart_temp_tx_publish(temp_c);
         }
 
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
