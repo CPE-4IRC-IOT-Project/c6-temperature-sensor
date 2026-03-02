@@ -22,6 +22,8 @@
 #include "host/ble_store.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
+#include "esp_random.h"
+#include "mbedtls/ccm.h"
 
 static const char *TAG = "c6-temp-adc";
 
@@ -32,26 +34,46 @@ static const char *TAG = "c6-temp-adc";
 #define SAMPLE_PERIOD_MS    1000
 
 /*
- * Typical KY-028/KY-013 NTC parameters.
- * Adjust these values if your module uses different resistor/thermistor specs.
+ * Calibration profile for this setup:
+ * - NTC model: 10k (R0 at 25 C), B3950
+ * - Divider orientation: NTC to VCC (NTC_TO_GND = 0)
+ * - Series resistor calibrated from room reference.
  */
-#define NTC_SERIES_RESISTOR_OHM    10000.0f
-#define NTC_NOMINAL_RESISTANCE_OHM 2700.0f
-#define NTC_NOMINAL_TEMPERATURE_C  21.5f
+#define NTC_SERIES_RESISTOR_OHM    2550.0f
+#define NTC_NOMINAL_RESISTANCE_OHM 10000.0f
+#define NTC_NOMINAL_TEMPERATURE_C  25.0f
 #define NTC_BETA_COEFFICIENT       3950.0f
 #define NTC_SUPPLY_VOLTAGE_MV      3300.0f
-#define NTC_TO_GND                 1
+#define NTC_TO_GND                 0
 #define ADC_SAMPLES_PER_READ       16
 #define ADC_SAMPLE_INTERVAL_MS     5
-#define VOLTAGE_EMA_ALPHA          0.05f
+#define ADC_MAX_SAMPLE_SPREAD_RAW  600
+#define VOLTAGE_EMA_ALPHA          0.20f
 #define NTC_VALID_MIN_MV           80.0f
 #define NTC_VALID_MAX_MV           3220.0f
+#define NTC_MAX_STEP_MV            350.0f
+#define NTC_MAX_JUMP_REJECTS       3
+#define TEMP_VALID_MIN_C           -20.0f
+#define TEMP_VALID_MAX_C           80.0f
+#define NTC_MIN_GOOD_SAMPLES       3
 #define BLE_TEMP_DEVICE_NAME       "C6-TEMP-SENSOR"
 #define UART_TX_PORT               UART_NUM_1
 #define UART_TX_PIN                16
 #define UART_TX_BAUD               115200
 #define UART_TX_RX_BUF_SIZE        256
 #define UART_MIRROR_TO_P4          0
+
+#define BLE_SEC_FRAME_VER          0x01
+#define BLE_SEC_KEY_ID             0x01
+#define BLE_SEC_NONCE_LEN          8
+#define BLE_SEC_TAG_LEN            4
+#define BLE_SEC_TEMP_PLAIN_LEN     2
+#define BLE_SEC_FRAME_LEN          16
+
+static const uint8_t BLE_SEC_PSK[16] = {
+    0x42, 0x4c, 0x45, 0x2d, 0x54, 0x45, 0x4d, 0x50,
+    0x2d, 0x4b, 0x45, 0x59, 0x2d, 0x31, 0x32, 0x33
+};
 
 // Shared BLE profile with ESP32-P4 client.
 static const ble_uuid128_t BLE_TEMP_SERVICE_UUID =
@@ -66,6 +88,8 @@ static uint16_t s_ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t s_ble_temp_val_handle = 0;
 static bool s_ble_notify_enabled = false;
 static int16_t s_ble_temp_centi = 0;
+static uint32_t s_ble_nonce_prefix = 0;
+static uint32_t s_ble_msg_counter = 0;
 
 void ble_store_config_init(void);
 
@@ -116,6 +140,11 @@ static float ntc_resistance_from_voltage(float voltage_mv)
 #endif
 }
 
+static bool ntc_voltage_is_valid(float voltage_mv)
+{
+    return (voltage_mv > NTC_VALID_MIN_MV) && (voltage_mv < NTC_VALID_MAX_MV);
+}
+
 static float ntc_temperature_c_from_resistance(float ntc_res_ohm)
 {
     if (!(ntc_res_ohm > 0.0f)) {
@@ -153,6 +182,52 @@ static esp_err_t raw_to_voltage_mv(int raw,
     return ESP_OK;
 }
 
+static void ble_sec_build_nonce(uint32_t msg_counter, uint8_t nonce[BLE_SEC_NONCE_LEN])
+{
+    nonce[0] = (uint8_t)(s_ble_nonce_prefix >> 24);
+    nonce[1] = (uint8_t)(s_ble_nonce_prefix >> 16);
+    nonce[2] = (uint8_t)(s_ble_nonce_prefix >> 8);
+    nonce[3] = (uint8_t)s_ble_nonce_prefix;
+    nonce[4] = (uint8_t)(msg_counter >> 24);
+    nonce[5] = (uint8_t)(msg_counter >> 16);
+    nonce[6] = (uint8_t)(msg_counter >> 8);
+    nonce[7] = (uint8_t)msg_counter;
+}
+
+static bool ble_sec_encrypt_temp(int16_t temp_centi, uint8_t out_frame[BLE_SEC_FRAME_LEN])
+{
+    uint8_t nonce[BLE_SEC_NONCE_LEN];
+    uint8_t plain[BLE_SEC_TEMP_PLAIN_LEN] = {
+        (uint8_t)(temp_centi & 0xFF),
+        (uint8_t)(((uint16_t)temp_centi >> 8) & 0xFF),
+    };
+
+    uint32_t msg_counter = ++s_ble_msg_counter;
+    ble_sec_build_nonce(msg_counter, nonce);
+
+    out_frame[0] = BLE_SEC_FRAME_VER;
+    out_frame[1] = BLE_SEC_KEY_ID;
+    memcpy(&out_frame[2], nonce, BLE_SEC_NONCE_LEN);
+
+    mbedtls_ccm_context ccm;
+    mbedtls_ccm_init(&ccm);
+    int rc = mbedtls_ccm_setkey(&ccm, MBEDTLS_CIPHER_ID_AES, BLE_SEC_PSK, 128);
+    if (rc == 0) {
+        rc = mbedtls_ccm_encrypt_and_tag(&ccm,
+                                         BLE_SEC_TEMP_PLAIN_LEN,
+                                         nonce,
+                                         BLE_SEC_NONCE_LEN,
+                                         out_frame,
+                                         2,
+                                         plain,
+                                         &out_frame[10],
+                                         &out_frame[12],
+                                         BLE_SEC_TAG_LEN);
+    }
+    mbedtls_ccm_free(&ccm);
+    return rc == 0;
+}
+
 static int ble_temp_chr_access_cb(uint16_t conn_handle,
                                   uint16_t attr_handle,
                                   struct ble_gatt_access_ctxt *ctxt,
@@ -166,11 +241,13 @@ static int ble_temp_chr_access_cb(uint16_t conn_handle,
         return BLE_ATT_ERR_UNLIKELY;
     }
 
-    uint8_t payload[2] = {
-        (uint8_t)(s_ble_temp_centi & 0xFF),
-        (uint8_t)(((uint16_t)s_ble_temp_centi >> 8) & 0xFF)
-    };
-    int rc = os_mbuf_append(ctxt->om, payload, sizeof(payload));
+    uint8_t frame[BLE_SEC_FRAME_LEN];
+    if (!ble_sec_encrypt_temp(s_ble_temp_centi, frame)) {
+        ESP_LOGE(TAG, "BLE encryption failed on read");
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    int rc = os_mbuf_append(ctxt->om, frame, sizeof(frame));
     return (rc == 0) ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
 }
 
@@ -336,11 +413,13 @@ static void ble_temp_publish(float temp_c)
         return;
     }
 
-    uint8_t payload[2] = {
-        (uint8_t)(centi & 0xFF),
-        (uint8_t)(((uint16_t)centi >> 8) & 0xFF)
-    };
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(payload, sizeof(payload));
+    uint8_t frame[BLE_SEC_FRAME_LEN];
+    if (!ble_sec_encrypt_temp(centi, frame)) {
+        ESP_LOGW(TAG, "BLE encryption failed on notify");
+        return;
+    }
+
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(frame, sizeof(frame));
     if (om == NULL) {
         ESP_LOGW(TAG, "BLE notify skipped (no mbuf)");
         return;
@@ -401,6 +480,9 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    esp_fill_random(&s_ble_nonce_prefix, sizeof(s_ble_nonce_prefix));
+    s_ble_msg_counter = 0;
+
     ESP_ERROR_CHECK(ble_temp_init());
 
     adc_oneshot_unit_handle_t adc_handle;
@@ -423,6 +505,8 @@ void app_main(void)
 
     bool ema_initialized = false;
     float voltage_ema_mv = 0.0f;
+    int jump_reject_count = 0;
+    int good_sample_streak = 0;
 
     while (1) {
         int min_raw = 4095;
@@ -448,6 +532,21 @@ void app_main(void)
 
         if (raw_valid_count < 3) {
             ESP_LOGE(TAG, "not enough valid ADC samples");
+            good_sample_streak = 0;
+            vTaskDelay(pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
+            continue;
+        }
+
+        int raw_spread = max_raw - min_raw;
+        if (raw_spread > ADC_MAX_SAMPLE_SPREAD_RAW) {
+            ESP_LOGW(TAG,
+                     "ADC unstable in-window (min=%d max=%d spread=%d): check AO wiring / floating input",
+                     min_raw,
+                     max_raw,
+                     raw_spread);
+            ema_initialized = false;
+            jump_reject_count = 0;
+            good_sample_streak = 0;
             vTaskDelay(pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
             continue;
         }
@@ -463,12 +562,57 @@ void app_main(void)
             voltage_instant_mv = estimate_voltage_mv_from_raw(raw_filtered);
         }
 
+        if (!ntc_voltage_is_valid(voltage_instant_mv)) {
+            ESP_LOGW(TAG,
+                     "GPIO4 raw=%d v_inst=%.0f mV out-of-range; sample ignored",
+                     raw_filtered,
+                     voltage_instant_mv);
+            // Re-arm filter on next valid sample to avoid a long stale tail after disconnection/glitch.
+            ema_initialized = false;
+            jump_reject_count = 0;
+            good_sample_streak = 0;
+            vTaskDelay(pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
+            continue;
+        }
+
         if (!ema_initialized) {
             voltage_ema_mv = voltage_instant_mv;
             ema_initialized = true;
+            jump_reject_count = 0;
         } else {
-            voltage_ema_mv = (VOLTAGE_EMA_ALPHA * voltage_instant_mv) +
-                             ((1.0f - VOLTAGE_EMA_ALPHA) * voltage_ema_mv);
+            float delta_mv = fabsf(voltage_instant_mv - voltage_ema_mv);
+            if (delta_mv > NTC_MAX_STEP_MV) {
+                jump_reject_count++;
+                if (jump_reject_count >= NTC_MAX_JUMP_REJECTS) {
+                    ESP_LOGW(TAG,
+                             "GPIO4 raw=%d v_inst=%.0f mV jump=%.0f mV: filter re-synced",
+                             raw_filtered,
+                             voltage_instant_mv,
+                             delta_mv);
+                    voltage_ema_mv = voltage_instant_mv;
+                    jump_reject_count = 0;
+                } else {
+                    ESP_LOGW(TAG,
+                             "GPIO4 raw=%d v_inst=%.0f mV jump=%.0f mV > %.0f mV; sample ignored (%d/%d)",
+                             raw_filtered,
+                             voltage_instant_mv,
+                             delta_mv,
+                             NTC_MAX_STEP_MV,
+                             jump_reject_count,
+                             NTC_MAX_JUMP_REJECTS);
+                    good_sample_streak = 0;
+                    vTaskDelay(pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
+                    continue;
+                }
+            } else {
+                jump_reject_count = 0;
+                voltage_ema_mv = (VOLTAGE_EMA_ALPHA * voltage_instant_mv) +
+                                 ((1.0f - VOLTAGE_EMA_ALPHA) * voltage_ema_mv);
+            }
+        }
+
+        if (good_sample_streak < NTC_MIN_GOOD_SAMPLES) {
+            good_sample_streak++;
         }
 
         float ntc_res_ohm = ntc_resistance_from_voltage(voltage_ema_mv);
@@ -478,14 +622,34 @@ void app_main(void)
                      raw_filtered,
                      voltage_instant_mv,
                      voltage_ema_mv);
+            good_sample_streak = 0;
         } else {
+            if (temp_c < TEMP_VALID_MIN_C || temp_c > TEMP_VALID_MAX_C) {
+                ESP_LOGW(TAG,
+                         "GPIO4 raw=%d v_inst=%.0f mV v_filt=%.0f mV temp=%.2f C out-of-range; not published",
+                         raw_filtered,
+                         voltage_instant_mv,
+                         voltage_ema_mv,
+                         temp_c);
+                good_sample_streak = 0;
+                vTaskDelay(pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
+                continue;
+            }
+
             ESP_LOGI(TAG, "GPIO4 raw=%d v_inst=%.0f mV v_filt=%.0f mV ntc=%.0f ohm temp=%.2f C",
                      raw_filtered,
                      voltage_instant_mv,
                      voltage_ema_mv,
                      ntc_res_ohm,
                      temp_c);
-            ble_temp_publish(temp_c);
+            if (good_sample_streak >= NTC_MIN_GOOD_SAMPLES) {
+                ble_temp_publish(temp_c);
+            } else {
+                ESP_LOGW(TAG,
+                         "temperature held (%d/%d stable samples before publish)",
+                         good_sample_streak,
+                         NTC_MIN_GOOD_SAMPLES);
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_PERIOD_MS));

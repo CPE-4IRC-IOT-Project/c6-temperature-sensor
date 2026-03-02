@@ -1,3 +1,3 @@
 idf_component_register(SRCS "main.c"
                     INCLUDE_DIRS "."
-                    REQUIRES bt driver esp_adc nvs_flash)
+                    REQUIRES bt driver esp_adc nvs_flash mbedtls)
