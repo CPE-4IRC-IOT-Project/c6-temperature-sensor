@@ -1,15 +1,26 @@
 #include <stdio.h>
 #include <inttypes.h>
 #include <math.h>
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "nvs_flash.h"
 #include "driver/adc_types_legacy.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+#include "host/ble_gatt.h"
+#include "host/ble_hs_adv.h"
+#include "host/ble_hs_mbuf.h"
+#include "host/ble_store.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
 
 static const char *TAG = "c6-temp-adc";
 
@@ -34,6 +45,23 @@ static const char *TAG = "c6-temp-adc";
 #define VOLTAGE_EMA_ALPHA          0.05f
 #define NTC_VALID_MIN_MV           80.0f
 #define NTC_VALID_MAX_MV           3220.0f
+#define BLE_TEMP_DEVICE_NAME       "C6-TEMP-SENSOR"
+
+// Shared BLE profile with ESP32-P4 client.
+static const ble_uuid128_t BLE_TEMP_SERVICE_UUID =
+    BLE_UUID128_INIT(0xf0, 0xde, 0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12,
+                     0x78, 0x56, 0x34, 0x12, 0x78, 0x56, 0x34, 0x12);
+static const ble_uuid128_t BLE_TEMP_CHARACTERISTIC_UUID =
+    BLE_UUID128_INIT(0xf1, 0xde, 0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12,
+                     0x78, 0x56, 0x34, 0x12, 0x78, 0x56, 0x34, 0x12);
+
+static uint8_t s_ble_addr_type = BLE_OWN_ADDR_PUBLIC;
+static uint16_t s_ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+static uint16_t s_ble_temp_val_handle = 0;
+static bool s_ble_notify_enabled = false;
+static int16_t s_ble_temp_centi = 0;
+
+void ble_store_config_init(void);
 
 static bool adc_calibration_init(adc_unit_t unit,
                                  adc_channel_t channel,
@@ -119,8 +147,209 @@ static esp_err_t raw_to_voltage_mv(int raw,
     return ESP_OK;
 }
 
+static int ble_temp_chr_access_cb(uint16_t conn_handle,
+                                  uint16_t attr_handle,
+                                  struct ble_gatt_access_ctxt *ctxt,
+                                  void *arg)
+{
+    (void)conn_handle;
+    (void)attr_handle;
+    (void)arg;
+
+    if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    uint8_t payload[2] = {
+        (uint8_t)(s_ble_temp_centi & 0xFF),
+        (uint8_t)(((uint16_t)s_ble_temp_centi >> 8) & 0xFF)
+    };
+    int rc = os_mbuf_append(ctxt->om, payload, sizeof(payload));
+    return (rc == 0) ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+
+static const struct ble_gatt_chr_def ble_temp_characteristics[] = {
+    {
+        .uuid = &BLE_TEMP_CHARACTERISTIC_UUID.u,
+        .access_cb = ble_temp_chr_access_cb,
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+        .val_handle = &s_ble_temp_val_handle,
+    },
+    {0},
+};
+
+static const struct ble_gatt_svc_def ble_temp_services[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = &BLE_TEMP_SERVICE_UUID.u,
+        .characteristics = ble_temp_characteristics,
+    },
+    {0},
+};
+
+static void ble_temp_advertise(void);
+
+static int ble_temp_gap_event(struct ble_gap_event *event, void *arg)
+{
+    (void)arg;
+
+    switch (event->type) {
+    case BLE_GAP_EVENT_CONNECT:
+        if (event->connect.status == 0) {
+            s_ble_conn_handle = event->connect.conn_handle;
+            ESP_LOGI(TAG, "BLE connected; conn_handle=%u", (unsigned)s_ble_conn_handle);
+        } else {
+            ESP_LOGW(TAG, "BLE connect failed; status=%d", event->connect.status);
+            ble_temp_advertise();
+        }
+        return 0;
+
+    case BLE_GAP_EVENT_DISCONNECT:
+        ESP_LOGW(TAG, "BLE disconnected; reason=%d", event->disconnect.reason);
+        s_ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        s_ble_notify_enabled = false;
+        ble_temp_advertise();
+        return 0;
+
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        if (event->subscribe.attr_handle == s_ble_temp_val_handle) {
+            s_ble_notify_enabled = event->subscribe.cur_notify != 0;
+            ESP_LOGI(TAG, "BLE notify=%d for temp characteristic", s_ble_notify_enabled ? 1 : 0);
+        }
+        return 0;
+
+    default:
+        return 0;
+    }
+}
+
+static void ble_temp_advertise(void)
+{
+    struct ble_hs_adv_fields fields = {0};
+    struct ble_gap_adv_params adv_params = {0};
+
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    fields.tx_pwr_lvl_is_present = 1;
+    fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
+    fields.name = (uint8_t *)BLE_TEMP_DEVICE_NAME;
+    fields.name_len = strlen(BLE_TEMP_DEVICE_NAME);
+    fields.name_is_complete = 1;
+    fields.uuids128 = (ble_uuid128_t *)&BLE_TEMP_SERVICE_UUID;
+    fields.num_uuids128 = 1;
+    fields.uuids128_is_complete = 1;
+
+    int rc = ble_gap_adv_set_fields(&fields);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "BLE adv set fields failed; rc=%d", rc);
+        return;
+    }
+
+    adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
+    adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+
+    rc = ble_gap_adv_start(s_ble_addr_type,
+                           NULL,
+                           BLE_HS_FOREVER,
+                           &adv_params,
+                           ble_temp_gap_event,
+                           NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "BLE adv start failed; rc=%d", rc);
+    }
+}
+
+static void ble_temp_on_reset(int reason)
+{
+    ESP_LOGE(TAG, "BLE host reset; reason=%d", reason);
+}
+
+static void ble_temp_on_sync(void)
+{
+    int rc = ble_hs_id_infer_auto(0, &s_ble_addr_type);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "BLE infer addr type failed; rc=%d", rc);
+        return;
+    }
+
+    ble_temp_advertise();
+}
+
+static void ble_temp_host_task(void *param)
+{
+    (void)param;
+    nimble_port_run();
+    nimble_port_freertos_deinit();
+}
+
+static esp_err_t ble_temp_init(void)
+{
+    int rc = nimble_port_init();
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG, "nimble_port_init failed: %d", rc);
+        return ESP_FAIL;
+    }
+
+    ble_hs_cfg.reset_cb = ble_temp_on_reset;
+    ble_hs_cfg.sync_cb = ble_temp_on_sync;
+    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    ble_svc_gap_device_name_set(BLE_TEMP_DEVICE_NAME);
+    ble_store_config_init();
+
+    rc = ble_gatts_count_cfg(ble_temp_services);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gatts_count_cfg failed: %d", rc);
+        return ESP_FAIL;
+    }
+    rc = ble_gatts_add_svcs(ble_temp_services);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gatts_add_svcs failed: %d", rc);
+        return ESP_FAIL;
+    }
+
+    nimble_port_freertos_init(ble_temp_host_task);
+    ESP_LOGI(TAG, "BLE temperature service started");
+    return ESP_OK;
+}
+
+static void ble_temp_publish(float temp_c)
+{
+    int16_t centi = (int16_t)lroundf(temp_c * 100.0f);
+    s_ble_temp_centi = centi;
+
+    if (s_ble_conn_handle == BLE_HS_CONN_HANDLE_NONE || !s_ble_notify_enabled) {
+        return;
+    }
+
+    uint8_t payload[2] = {
+        (uint8_t)(centi & 0xFF),
+        (uint8_t)(((uint16_t)centi >> 8) & 0xFF)
+    };
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(payload, sizeof(payload));
+    if (om == NULL) {
+        ESP_LOGW(TAG, "BLE notify skipped (no mbuf)");
+        return;
+    }
+
+    int rc = ble_gatts_notify_custom(s_ble_conn_handle, s_ble_temp_val_handle, om);
+    if (rc != 0 && rc != BLE_HS_ENOTCONN) {
+        ESP_LOGW(TAG, "BLE notify failed; rc=%d", rc);
+    }
+}
+
 void app_main(void)
 {
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    ESP_ERROR_CHECK(ble_temp_init());
+
     adc_oneshot_unit_handle_t adc_handle;
     adc_oneshot_unit_init_cfg_t init_config = {
         .unit_id = TEMP_ADC_UNIT,
@@ -203,6 +432,7 @@ void app_main(void)
                      voltage_ema_mv,
                      ntc_res_ohm,
                      temp_c);
+            ble_temp_publish(temp_c);
         }
 
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
