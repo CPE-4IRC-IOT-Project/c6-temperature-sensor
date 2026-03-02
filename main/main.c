@@ -50,6 +50,8 @@ static const char *TAG = "c6-temp-adc";
 #define UART_TX_PORT               UART_NUM_1
 #define UART_TX_PIN                16
 #define UART_TX_BAUD               115200
+#define UART_TX_RX_BUF_SIZE        256
+#define UART_MIRROR_TO_P4          0
 
 // Shared BLE profile with ESP32-P4 client.
 static const ble_uuid128_t BLE_TEMP_SERVICE_UUID =
@@ -350,6 +352,7 @@ static void ble_temp_publish(float temp_c)
     }
 }
 
+#if UART_MIRROR_TO_P4
 static void uart_temp_tx_init(void)
 {
     const uart_config_t cfg = {
@@ -361,7 +364,8 @@ static void uart_temp_tx_init(void)
         .source_clk = UART_SCLK_DEFAULT,
     };
 
-    ESP_ERROR_CHECK(uart_driver_install(UART_TX_PORT, 0, 0, 0, NULL, 0));
+    // ESP-IDF UART driver requires a non-zero RX buffer length.
+    ESP_ERROR_CHECK(uart_driver_install(UART_TX_PORT, UART_TX_RX_BUF_SIZE, 0, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(UART_TX_PORT, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(UART_TX_PORT,
                                  UART_TX_PIN,
@@ -386,6 +390,7 @@ static void uart_temp_tx_publish(float temp_c)
         ESP_LOGW(TAG, "UART temp write short: %d/%d", written, n);
     }
 }
+#endif
 
 void app_main(void)
 {
@@ -397,7 +402,6 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     ESP_ERROR_CHECK(ble_temp_init());
-    uart_temp_tx_init();
 
     adc_oneshot_unit_handle_t adc_handle;
     adc_oneshot_unit_init_cfg_t init_config = {
@@ -482,7 +486,6 @@ void app_main(void)
                      ntc_res_ohm,
                      temp_c);
             ble_temp_publish(temp_c);
-            uart_temp_tx_publish(temp_c);
         }
 
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
