@@ -33,5 +33,5 @@ idf.py -p <PORT_C6_SENSOR> flash monitor
 ## Câblage
 
 - `AO` du capteur NTC -> `GPIO4`
-- `VCC` -> `3V3`
+- `+` -> `3V3`
 - `GND` -> `GND`
